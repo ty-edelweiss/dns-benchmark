@@ -15,12 +15,15 @@ int main(int argc, char** argv) {
     desc.add_options()
         ("help,h", "print help messages")
         ("verbose,v", "be verbose")
+        ("server,n", bpo::value<std::string>(), "name server address")
         ("type,q", bpo::value<std::string>()->default_value("A"), "type of DNS queries")
         ("count,c", bpo::value<int>()->default_value(1), "number of DNS queries")
         ("thread_num,t", bpo::value<int>()->default_value(1), "number of threads in each process")
         // TODO: implement multi-porcesses soon
         // ("process_num,p", bpo::value<int>()->default_value(1), "number of processes")
         ("version", "print version")
+        ("norecurse", "turn off recursive DNS option")
+        ("noedns", "turn off EDNS option")
         ("check", "send single query and show answer")
         ("domain",  "target domain e.g. www.google.com")
     ;
@@ -56,13 +59,26 @@ int main(int argc, char** argv) {
         query = dns::MX;
     } else if (type == "TXT") {
         query = dns::TXT;
+    } else if (type == "NS") {
+        query = dns::NS;
+    } else if (type == "SOA") {
+        query = dns::SOA;
     } else {
         query = dns::A;
     }
 
+    std::string ns;
+    if (vm.count("server")) {
+        ns = vm["server"].as<std::string>();
+    }
+
+    bool recurse = !vm.count("norecurse");
+    bool edns = !vm.count("noedns");
+
     if (vm.count("check")) {
-        dns::Client* client = new dns::Client();
-        client->resolv(domain, query);
+        dns::Client* client =
+            !ns.empty() ? new dns::Client(ns) : new dns::Client();
+        client->resolv(domain, query, recurse, edns);
         return 0;
     }
 

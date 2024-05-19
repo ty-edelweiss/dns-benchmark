@@ -20,6 +20,8 @@ enum Type {
     CNAME,
     MX,
     TXT,
+    NS,
+    SOA,
 };
 
 struct Answer {
@@ -29,8 +31,15 @@ struct Answer {
         std::string name;
         Type type;
         std::string data;
+        std::string other;
         std::vector<int> attr;
         size_t size;
+    };
+
+    struct OptRecord {
+        size_t udp;
+        int version;
+        bool dnssec;
     };
 
     struct Metrics {
@@ -41,9 +50,12 @@ struct Answer {
     Status status;
 
     bool authority;
+    bool recurse;
+    bool edns;
 
     int count;
     std::vector<Record> records;
+    OptRecord opt;
 
     // DNS metrics
     Metrics metrics;
@@ -73,9 +85,11 @@ public:
     Client();
     Client(const std::string ns);
     int resolv(const std::string dname, const Type type = A,
+               const bool recurse = true, const bool edns = true,
                const bool wout = true, const unsigned int ntrials = 1);
     int resolv(const std::string dname, const unsigned int port,
-               const Type type = A, const bool wout = true,
+               const Type type = A, const bool recurse = true,
+               const bool edns = true, const bool wout = true,
                const unsigned int ntrials = 1);
     std::shared_ptr<Answer> answer();
     std::vector<std::shared_ptr<Answer>> answers();

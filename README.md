@@ -3,7 +3,7 @@
 support A/AAAA/PTR/CNAME/MX/TXT record only.
 *No IPv6 support for PTR record.
 
-TCP fallback and EDNS0 are not supported.
+TCP fallback is not supported.
 
 ## Build
 

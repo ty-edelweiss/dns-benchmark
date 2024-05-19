@@ -8,6 +8,7 @@
 #include <iostream>
 #include <fstream>
 #include <algorithm>
+#include <regex>
 #include <iterator>
 #include <format>
 
@@ -59,15 +60,16 @@ Client::Client() {
 
 Client::Client(const std::string ns) { nss_.push_back(ns); }
 
-int Client::resolv(const std::string dname, const Type type, const bool wout,
+int Client::resolv(const std::string dname, const Type type, const bool recurse,
+                   const bool edns, const bool wout,
                    const unsigned int ntrials) {
-    return resolv(dname, DNS_PORT, type, wout, ntrials);
+    return resolv(dname, DNS_PORT, type, recurse, edns, wout, ntrials);
 }
 
 // support UDP only.
 int Client::resolv(const std::string dname, const unsigned int port,
-                   const Type type, const bool wout,
-                   const unsigned int ntrials) {
+                   const Type type, const bool recurse, const bool edns,
+                   const bool wout, const unsigned int ntrials) {
     int sockfd;
     struct sockaddr_in addr;
 
@@ -109,11 +111,26 @@ int Client::resolv(const std::string dname, const unsigned int port,
         case TXT:
             qtype = ns_t_txt;
             break;
+        case NS:
+            qtype = ns_t_ns;
+            break;
+        case SOA:
+            qtype = ns_t_soa;
+            break;
         case A:
         default:
             qtype = ns_t_a;
             break;
     }
+
+    res_state state = new __res_state;
+    state->options = RES_INIT;
+#ifndef NDEBUG
+    state->options |= RES_DEBUG;
+#endif
+
+    if (recurse) state->options |= RES_RECURSE;
+    if (edns) state->options |= RES_USE_EDNS0;
 
     unsigned char query[DNS_BUFFER_SIZE];
     size_t qlen;
@@ -121,8 +138,9 @@ int Client::resolv(const std::string dname, const unsigned int port,
 #ifndef NDEBUG
         util::debug("query => ", dname);
 #endif
-        qlen = res_mkquery(ns_o_query, dname.c_str(), ns_c_in, qtype, nullptr,
-                           0, nullptr, query, sizeof(query));
+        qlen = res_nmkquery(state, ns_o_query, dname.c_str(), ns_c_in, qtype,
+                            nullptr, 0, nullptr, query, sizeof(query));
+        if (edns) qlen = res_nopt(state, qlen, query, sizeof(query), EDNS0_BUFFER_SIZE);
     } else {
         // Only IPv4 is supported for PTR query.
         unsigned char tmp[INET_ADDRSTRLEN];
@@ -136,23 +154,26 @@ int Client::resolv(const std::string dname, const unsigned int port,
 #ifndef NDEBUG
         util::debug("query => ", daddr);
 #endif
-        qlen = res_mkquery(ns_o_query, daddr.c_str(), ns_c_in, qtype, nullptr,
-                           0, nullptr, query, sizeof(query));
+        qlen = res_nmkquery(state, ns_o_query, daddr.c_str(), ns_c_in, qtype,
+                            nullptr, 0, nullptr, query, sizeof(query));
+        if (edns) qlen = res_nopt(state, qlen, query, sizeof(query), EDNS0_BUFFER_SIZE);
     }
+
+    res_ndestroy(state);
 
     ans_.clear();
 
     for (int i = 0; i < ntrials; i++) {
         std::chrono::system_clock::time_point start, end;
 
+        start = std::chrono::system_clock::now();
+
         if (send(sockfd, query, qlen, 0) < 0) {
             perror("error on send()");
             continue;
         }
 
-        start = std::chrono::system_clock::now();
-
-        unsigned char buffer[DNS_BUFFER_SIZE];
+        unsigned char buffer[EDNS0_BUFFER_SIZE];
         ssize_t length;
         if ((length = recv(sockfd, buffer, sizeof(buffer) - 1, 0)) < 0) {
             perror("error on recv()");
@@ -185,9 +206,13 @@ std::vector<std::shared_ptr<Answer>> Client::answers() { return ans_; }
 std::shared_ptr<Answer> Client::parse(
     const unsigned char* ans, const size_t alen,
     const std::chrono::duration<double, std::milli> elapsed) {
-    std::shared_ptr<Answer> answer = std::make_shared<Answer>(Answer{
-        /* status */ Answer::Error, /* authority */ false, /* count */ 1,
-        /* records */ {}, /* metrics */ {/* elapsed */ elapsed, /* total */}});
+    std::shared_ptr<Answer> answer = std::make_shared<Answer>(
+        Answer{/* status */ Answer::Error, /* authority */ false,
+               /* recurse */ false, /* edns */ false,
+               /* count */ 1,
+               /* records */ {},
+               /* opt */ {},
+               /* metrics */ {/* elapsed */ elapsed, /* total */ alen}});
 
     answer->metrics.elapsed = elapsed;
     answer->metrics.total = alen;
@@ -195,6 +220,7 @@ std::shared_ptr<Answer> Client::parse(
     HEADER* hp = (HEADER*)ans;
 
     answer->authority = (bool)hp->aa;
+    answer->recurse = (bool)hp->ra;
 
     if (hp->rcode) {
         std::cerr << "failed to get answer: RCODE[" << hp->rcode << "]"
@@ -216,8 +242,12 @@ std::shared_ptr<Answer> Client::parse(
 
     // parse DNS record.
     ns_rr rr;
+
+    // parse Answer section.
     for (int i = 0; i < answer->count; i++) {
         int n;
+        const unsigned char* cp;
+
         char addr[INET_ADDRSTRLEN];
         char addr6[INET6_ADDRSTRLEN];
         char dname[MAXDNAME];
@@ -284,6 +314,52 @@ std::shared_ptr<Answer> Client::parse(
                 record.data = std::string(
                     reinterpret_cast<const char*>(ns_rr_rdata(rr) + 1), n);
                 break;
+            case /* NS record */ ns_t_ns:
+                record.type = NS;
+                if (ns_name_uncompress(ns_msg_base(msg), ns_msg_end(msg),
+                                       ns_rr_rdata(rr), dname,
+                                       sizeof(dname)) < 0) {
+                    std::cerr << "failed to uncompress record #" << i
+                              << std::endl;
+                    continue;
+                }
+                record.data = dname;
+                break;
+            case /* SOA record */ ns_t_soa:
+                record.type = SOA;
+                cp = ns_rr_rdata(rr);
+                n = ns_name_uncompress(ns_msg_base(msg), ns_msg_end(msg), cp,
+                                       dname, sizeof(dname));
+                if (n < 0) {
+                    std::cerr << "failed to uncompress record #" << i
+                              << std::endl;
+                    continue;
+                }
+                record.data = dname;
+                cp += n;
+
+                n = ns_name_uncompress(ns_msg_base(msg), ns_msg_end(msg), cp,
+                                       dname, sizeof(dname));
+                if (n < 0) {
+                    std::cerr << "failed to uncompress record #" << i
+                              << std::endl;
+                    continue;
+                }
+                record.other =
+                    std::regex_replace(dname, std::regex("([^\\\\])\\."), "$1@",
+                                       std::regex_constants::format_first_only);
+                cp += n;
+
+                record.attr.push_back(ns_get32(cp));
+                cp += 4;
+                record.attr.push_back(ns_get32(cp));
+                cp += 4;
+                record.attr.push_back(ns_get32(cp));
+                cp += 4;
+                record.attr.push_back(ns_get32(cp));
+                cp += 4;
+                record.attr.push_back(ns_get32(cp));
+                break;
             default:
 #ifndef NDEBUG
                 util::debug("DNS record #", i, " skipped");
@@ -292,6 +368,33 @@ std::shared_ptr<Answer> Client::parse(
         }
 
         answer->records.push_back(record);
+    }
+
+    // parse Additional records section.
+    for (int i = 0; i < ns_msg_count(msg, ns_s_ar); i++) {
+        int n;
+        const unsigned char* cp;
+
+        if (ns_parserr(&msg, ns_s_ar, i, &rr)) {
+            std::cerr << "failed to parse addtional record #" << i << std::endl;
+            continue;
+        }
+
+        if (ns_rr_type(rr) != ns_t_opt) {
+            continue;
+        }
+
+        n = ns_rr_ttl(rr);
+        cp = reinterpret_cast<const unsigned char*>(&n);
+
+        Answer::OptRecord record;
+
+        record.udp = ns_rr_class(rr);
+        record.version = cp[1];
+        record.dnssec = (cp[2] >> 7) & 1;
+
+        answer->edns = true;
+        answer->opt = record;
     }
 
     answer->status = Answer::Ok;
@@ -308,27 +411,44 @@ int Client::print(const std::shared_ptr<Answer> ans) {
         std::cout << "Non-Authoritative Answer:" << std::endl;
     }
 
-    for (Answer::Record& record : ans->records) {
+    if (ans->edns) {
+        std::cout << "EDNS0: ";
+        std::cout << "udp=" << ans->opt.udp << ", ";
+        std::cout << "dnssec=" << (ans->opt.dnssec ? "on" : "off");
+        std::cout << std::endl;
+    }
+
+    for (int i = 0; i < ans->count; i++) {
+        Answer::Record& record = ans->records[i];
         switch (record.type) {
             case A:
             case AAAA:
-                std::cout << "Name:\t" << record.name << std::endl;
                 std::cout << "Address: " << record.data << std::endl;
                 break;
             case PTR:
-                std::cout << "Address: " << record.name << std::endl;
-                std::cout << "Name:\t" << record.data << std::endl;
+                std::cout << "Name: " << record.data << std::endl;
                 break;
             case CNAME:
-                std::cout << "Name:\t" << record.name;
-                std::cout << " <CNAME>" << std::endl;
+                std::cout << "Name: " << record.data << std::endl;
                 break;
             case MX:
-                std::cout << "Exchange:\t" << record.data;
-                std::cout << " <" << record.attr[0] << ">" << std::endl;
+                std::cout << "Name: " << record.data << " "
+                          << std::format("<{:d}>", record.attr[0]) << std::endl;
                 break;
             case TXT:
-                std::cout << "Text:\t" << record.data << std::endl;
+                std::cout << "Text: " << record.data << std::endl;
+                break;
+            case NS:
+                std::cout << "Name: " << record.data << std::endl;
+                break;
+            case SOA:
+                std::cout << "Name: " << record.data << " "
+                          << std::format("<{:s}>", record.other) << std::endl;
+                std::cout << "Serial No.: " << record.attr[0] << std::endl;
+                std::cout << "Refersh Time: " << record.attr[1] << std::endl;
+                std::cout << "Retry Time: " << record.attr[2] << std::endl;
+                std::cout << "Expire Time: " << record.attr[3] << std::endl;
+                std::cout << "Minimum TTL: " << record.attr[4] << std::endl;
                 break;
             default:
                 break;
